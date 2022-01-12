@@ -16,7 +16,7 @@ class AttentionQA(nn.Module):
                  reasoning_use_answer = True,
                  reasoning_use_question = True,
                  pool_reasoning = True,
-                 pool_answer = True,
+                 pool_answer = False,
                  pool_question = False):
         super(AttentionQA, self).__init__()
         span_config = config.span_encoder
@@ -31,9 +31,9 @@ class AttentionQA(nn.Module):
 
         self.reasoning_encoder = nn.LSTM(reasoning_config.input_size, reasoning_config.hidden_size, reasoning_config.num_layers, bidirectional=reasoning_config.bidirectional)
         # key : question & value : answer
-        self.span_attention = BilinearMatrixAttention(span_config.hidden_size*2,span_config.hidden_size*2)
+        self.span_attention = BilinearMatrixAttention(span_config.hidden_size*2, span_config.hidden_size*2)
         # key: answer & value: object
-        self.obj_attention = BilinearMatrixAttention(span_config.hidden_size*2, span_config.hidden_size*2)
+        self.obj_attention = BilinearMatrixAttention(span_config.hidden_size*2, self.detector.final_dim)
 
         self.reasoning_use_obj = reasoning_use_obj
         self.reasoning_use_answer = reasoning_use_answer
@@ -42,14 +42,15 @@ class AttentionQA(nn.Module):
         self.pool_answer = pool_answer
         self.pool_question = pool_question
 
-        dim = sum([d for d, to_pool in [(reasoning_config.hidden_size, self.pool_reasoning),
-                                        (span_config.hidden_size, self.pool_answer),
-                                        (span_config.hidden_size, self.pool_question)] if to_pool])
+        dim = sum([d for d, to_pool in [(reasoning_config.hidden_size*2, self.pool_reasoning),
+                                        (span_config.hidden_size*2, self.pool_answer),
+                                        (span_config.hidden_size*2, self.pool_question)] if to_pool])
+
 
 
         self.final_mlp = torch.nn.Sequential(
             torch.nn.Dropout(input_dropout, inplace=False),
-            torch.nn.Linear(hidden_dim_maxpool, hidden_dim_maxpool), # 512,1024
+            torch.nn.Linear(dim, hidden_dim_maxpool), # 512,1024
             torch.nn.ReLU(inplace=True),
             torch.nn.Dropout(input_dropout, inplace=False),
             torch.nn.Linear(hidden_dim_maxpool, 1),
@@ -124,12 +125,11 @@ class AttentionQA(nn.Module):
         B, N, A, D = reasoning_inp.shape
         reasoning_output, _ = self.reasoning_encoder(reasoning_inp.view(B*N, A, D))
         reasoning_output = reasoning_output.view(B, N, A, -1)
-
         things_to_pool = torch.cat([x for x, to_pool in [(reasoning_output, self.pool_reasoning),
                                                          (a_rep, self.pool_answer),
                                                          (attended_q, self.pool_question)] if to_pool], -1)
 
-        pooled_rep = replace_masked_values(things_to_pool, answer_mask[...,None], -1e7).max(2)[0] # 2dim 에서 값이 가장 큰 텐서만 모음,(max pool) batch, 4, dim
+        pooled_rep = replace_masked_values(things_to_pool, answer_mask[...,None], -1e7).max(2)[0] #  answer token 중 가장 중요한 토큰 표현만 남김 (max pool) (batch, 4, 9, 1024) -> (batch, 4, 1024)
         logits = self.final_mlp(pooled_rep).squeeze(2)
 
         class_probabilites = F.softmax(logits, dim=-1)
@@ -161,8 +161,8 @@ class AttentionQA(nn.Module):
         row_id += row_id_broadcaster
         return object_reps[row_id.view(-1), span_tags_fixed.view(-1)].view(*span_tags_fixed.shape, -1)
 
-    def embed_span(self, span, span_tags, span_mask , object_reps):
-        features = self._collect_obj_reps(span_tags, object_reps)
+    def embed_span(self, span, span_tags, span_mask , object_reps): # span : 3, 4, 7, 768
+        features = self._collect_obj_reps(span_tags, object_reps) # 3, 4, 7, 512
         span_rep = torch.cat((span, features), -1)
         B_, N, K, D = span_rep.shape
 
@@ -214,3 +214,14 @@ if __name__ == '__main__':
                    data["question_mask"], data["answer"], data["answer_tags"],data["answer_mask"], data["label"])
     print(output)
 
+
+
+# from torchvision.models import resnet
+# backbone = resnet.resnet50(pretrained=True)
+#
+# for i in range(2, 4): # 2,3,4 convolution layer 에서
+#         getattr(backbone, 'layer%d' % i)[0].conv1.stride = (2, 2)  # conv1 사이즈 줄이고
+#         getattr(backbone, 'layer%d' % i)[0].conv2.stride = (1, 1) # conv2 사이즈 동일
+#     # use stride 1 for the last conv4 layer (same as tf-faster-rcnn)
+#     backbone.layer4[0].conv2.stride = (1, 1) # 이미지 사이즈 이전과 동일 faster R-CNN 과 동일한 구조
+#     backbone.layer4[0].downsample[0].stride = (1, 1)  # 이미지 사이즈 이전과 동일 faster R-CNN 과 동일한 구조
